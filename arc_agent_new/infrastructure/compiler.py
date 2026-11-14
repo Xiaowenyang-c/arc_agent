@@ -1,0 +1,163 @@
+"""Run the complete requirement compiler in one process using the existing passes."""
+
+import os
+from importlib import import_module
+from pathlib import Path
+import traceback
+
+from infrastructure.utils.presentation.console import show_panel
+from infrastructure.utils.presentation.logging import console_log
+from infrastructure.utils.files import save_json
+from infrastructure.shared.project.git import checkpoint
+
+
+def _env_int(name: str, default: int) -> int:
+    """Read an integer budget override; invalid or empty values keep the default."""
+    value = os.getenv(name, "").strip()
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    return parsed if parsed > 0 else default
+
+
+class Compiler:
+    """Own shared paths, configuration, and results for one compilation."""
+
+    def __init__(self, input_dir: Path, output_dir: Path, model_log: bool = False, port: int = 3000) -> None:
+        if not 1 <= port <= 65535:
+            raise ValueError("Backend port must be between 1 and 65535")
+        self.input_dir = Path(input_dir).expanduser().resolve()
+        self.output_dir = Path(output_dir).expanduser().resolve()
+        self.arc_dir = self.output_dir / ".arc"
+        self.model_log = model_log
+        self.port = port
+        self.artifacts: dict[str, object] = {}
+        self.current_stage: str | None = None
+        self.report = {"status": "NOT_STARTED", "stages": {}}
+        # Local-experiment budgets; env overrides are honored. max_turns is tightened from the
+        # original 10 to 6: local statistics show healthy runs never need more than 4 edit
+        # rounds, and capping the limit cuts the burn of pathological loops without touching
+        # healthy runs. acceptance_turns stays at the original 4: acceptance repair is the
+        # last quality gate before the app ships, and one local run with 3 showed label-exact
+        # regressions in the transcription suite, so the saving is not worth the risk.
+        self.max_turns = _env_int("ARC_MAX_TURNS", 6)
+        self.max_attempts = _env_int("ARC_MAX_ATTEMPTS", 10)
+        self.max_tests = _env_int("ARC_MAX_TESTS", 5)
+        self.ui_max_tests = _env_int("ARC_UI_MAX_TESTS", 2)
+        self.acceptance_turns = _env_int("ARC_ACCEPTANCE_TURNS", 4)
+
+    def _run(self, module: str, function: str, *arguments, **options):
+        """Attempt every pass; keep failures explicit without aborting later passes."""
+        self.current_stage = module + ".py"
+        try:
+            with console_log(self.output_dir, stage=self.current_stage,
+                    model_log=self.model_log, debug_model_io=self.model_log):
+                result = getattr(import_module(module), function)(*arguments, **options)
+        except KeyboardInterrupt as error:
+            self.report["status"] = "INTERRUPTED"
+            self.report["stages"][module] = {"status": "INTERRUPTED", "error": str(error)}
+            save_json(self.arc_dir / "compilation.json", self.report)
+            checkpoint(self.output_dir, stage=module, task="stage report", action="Record interrupted pass",
+                status="INTERRUPTED", details=self.report["stages"][module])
+            raise
+        except Exception as error:
+            result = {"status": "FAILED", "error": str(error),
+                "error_type": type(error).__name__, "traceback": traceback.format_exc()}
+            if getattr(error, "failures", None):
+                result.update(status="COMPLETED_WITH_FAILURES", failures=error.failures)
+            show_panel("[FAILED; continuing] " + module,
+                result["error"] + "\nAccepted artifacts remain available. Attempt the next pass.", tone="error")
+        status = result.get("status", "GREEN") if isinstance(result, dict) else "GREEN"
+        self.report["stages"][module] = {"status": status}
+        if isinstance(result, dict):
+            for key in ("failures", "verification", "error", "error_type", "traceback"):
+                if key in result:
+                    self.report["stages"][module][key] = result[key]
+        save_json(self.arc_dir / "compilation.json", self.report)
+        checkpoint(self.output_dir, stage=module, task="stage report", action="Publish pass result",
+            status=status, details=self.report["stages"][module])
+        return result
+
+    def _finish(self, incomplete: list[str]) -> Path:
+        """Write the final report, checkpoint it, and print the summary panel."""
+        self.current_stage = None
+        self.report["status"] = "COMPLETED_WITH_FAILURES" if incomplete else "GREEN"
+        save_json(self.arc_dir / "compilation.json", self.report)
+        checkpoint(self.output_dir, stage="compiler", task="pipeline", action="Publish final compilation report",
+            status=self.report["status"], details={"stages": self.report["stages"], "incomplete_stages": incomplete})
+        show_panel("[DONE] Requirement compilation | " + self.report["status"],
+            f"Application: {self.output_dir}\nReport: {self.arc_dir / 'compilation.json'}"
+            + ("\nIncomplete stages: " + ", ".join(incomplete) if incomplete else ""),
+            tone="error" if incomplete else "success")
+        return self.output_dir
+
+    def compile(self) -> Path:
+        """Execute the compilation passes in order and return the generated application directory.
+
+        Small tasks take the lean fast path (one generated stdlib app, browser-free local
+        checks, bounded repairs). When the fast path does not finish GREEN the full pipeline
+        runs afterwards, so the quality gate is never weakened.
+        """
+        self.artifacts.clear()
+        self.report = {"status": "RUNNING", "stages": {}}
+        show_panel("Requirement compiler | Pipeline",
+            f"Input: {self.input_dir}\nOutput: {self.output_dir}\nPasses: 13 + lean fast path\nDetailed model logs: {'enabled' if self.model_log else 'disabled'}")
+        self.artifacts["project_files"] = self._run(
+            "00_project_initialization", "project_initialization", self.output_dir, port=self.port)
+        try:
+            fastpath = import_module("13_fastpath")
+            use_fastpath = fastpath.eligible(self.input_dir)
+        except Exception as error:
+            show_panel("Lean fast path unavailable", f"{error}", tone="warn")
+            use_fastpath = False
+        if use_fastpath:
+            fast_result = self._run("13_fastpath", "generate", self.input_dir, self.output_dir, port=self.port)
+            fast = self.report["stages"].get("13_fastpath", {})
+            if fast.get("status") == "GREEN":
+                usage = (fast_result or {}).get("usage") or {}
+                self.report["fastpath"] = {"status": "GREEN", "usage": usage}
+                self.report["stages"].pop("13_fastpath", None)
+                return self._finish([])
+            problems = (fast_result or {}).get("problems")
+            if not problems and (fast_result or {}).get("error"):
+                problems = [str((fast_result or {})["error"])]
+            problems = problems or []
+            self.report["fastpath"] = {"status": "fallback", "problems": problems[:10]}
+            self.report["stages"].pop("13_fastpath", None)
+            show_panel("Lean fast path did not finish green",
+                f"{len(problems)} local problem(s); falling back to the full 13-pass pipeline.",
+                tone="warn")
+        self.artifacts["requirements"] = self._run(
+            "01_explore_requirement", "explore_requirement", self.input_dir, self.arc_dir)
+        self.artifacts["db_schema"] = self._run(
+            "02_build_db_schema", "build_db_schema", self.arc_dir)
+        self.artifacts["db_obligations"] = self._run(
+            "03_infer_db_obligations", "infer_db_obligations", self.arc_dir)
+        self.artifacts["db_obligations"] = self._run(
+            "04_check_db_obligations", "check_db_obligations", self.arc_dir)
+        self.artifacts["db_implementations"] = self._run(
+            "05_implement_db", "implement_db", self.arc_dir,
+            max_attempts=self.max_attempts, max_turns=self.max_turns)
+        self.artifacts["backend_apis"] = self._run(
+            "06_design_backend_apis", "design_backend_apis", self.arc_dir)
+        self.artifacts["backend_apis"] = self._run(
+            "07_check_backend_apis", "check_backend_apis", self.arc_dir)
+        self.artifacts["backend_checks"] = self._run(
+            "08_implement_backend_tdd", "implement_backend_tdd", self.arc_dir,
+            max_turns=self.max_turns, max_tests=self.max_tests)
+        self.artifacts["ui_design"] = self._run(
+            "09_design_ui", "design_frontend_ui", self.input_dir, self.arc_dir)
+        self.artifacts["ui_checks"] = self._run(
+            "10_implement_ui", "implement_frontend_ui", self.input_dir, self.arc_dir,
+            max_turns=self.max_turns)
+        self.artifacts["frontend_triggers"] = self._run(
+            "11_design_frontend_triggers", "design_frontend_triggers", self.input_dir, self.arc_dir,
+            max_attempts=self.max_attempts)
+        self.artifacts["frontend_e2e"] = self._run(
+            "12_implement_frontend_tdd", "implement_frontend_triggers", self.input_dir, self.arc_dir,
+            max_turns=self.max_turns, max_tests=self.ui_max_tests,
+            acceptance_turns=self.acceptance_turns)
+        incomplete = [stage for stage, result in self.report["stages"].items()
+            if result["status"] in {"FAILED", "COMPLETED_WITH_FAILURES"}]
+        return self._finish(incomplete)
